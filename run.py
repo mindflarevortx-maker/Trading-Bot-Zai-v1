@@ -19,16 +19,37 @@ import asyncio
 import logging
 import os
 import sys
-import signal as sig
 from pathlib import Path
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# ─── Load .env file BEFORE importing config ──────────────────────────
+def load_dotenv():
+    """Load .env file into os.environ if it exists."""
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                # Only set if not already in environment
+                if key and key not in os.environ:
+                    os.environ[key] = value
+
+load_dotenv()
+
 from bot.config import (
-    QUOTEX_EMAIL, QUOTEX_PASSWORD, FLASK_HOST, FLASK_PORT,
-    LOG_LEVEL, LOG_FORMAT, LOG_DIR,
+    QUOTEX_EMAIL, QUOTEX_PASSWORD, QUOTEX_HOST, FLASK_HOST, FLASK_PORT,
+    LOG_LEVEL, LOG_FORMAT, LOG_DIR, ACCOUNT_MODE,
 )
 from bot.scheduler import TradingScheduler
 from bot.flask_app import run_flask
@@ -102,6 +123,7 @@ async def main():
         print("\nOr create a .env file in the project root:")
         print("  QUOTEX_EMAIL=your_email@example.com")
         print("  QUOTEX_PASSWORD=your_password")
+        print("  QUOTEX_HOST=market-qx.trade")
         sys.exit(1)
 
     # Initialize scheduler
@@ -114,8 +136,9 @@ async def main():
 
     # Start the trading scheduler
     print(f"\n🚀 Starting trading bot...")
+    print(f"   Host: {QUOTEX_HOST}")
     print(f"   Email: {QUOTEX_EMAIL[:3]}***@{QUOTEX_EMAIL.split('@')[1] if '@' in QUOTEX_EMAIL else '***'}")
-    print(f"   Mode: PRACTICE")
+    print(f"   Mode: {ACCOUNT_MODE}")
     print(f"   Assets: 100+ pairs (Forex, OTC, Crypto, Commodities, Indices)")
     print(f"   Strategy: 7-Layer Confluence + Backtesting")
     print(f"   Signal threshold: 95%+ confidence")
@@ -124,6 +147,11 @@ async def main():
     started = await scheduler.start()
     if not started:
         print("\n❌ Failed to start. Check logs for details.")
+        print("   Common fixes:")
+        print("   1. Check your email/password in .env")
+        print("   2. Make sure QUOTEX_HOST is correct (e.g. market-qx.trade)")
+        print("   3. Delete session.json and retry")
+        print("   4. Check your internet connection")
         sys.exit(1)
 
     # Keep running until interrupted
