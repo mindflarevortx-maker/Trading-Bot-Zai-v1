@@ -55,7 +55,7 @@ class DataFetcher:
                 try:
                     self._progress[asset]["attempt"] = attempt
 
-                    def progress_cb(fetched_sec, total_sec, count):
+                    def progress_cb(fetched_sec, total_sec, count, worker_label=""):
                         self._progress[asset]["candles"] = count
 
                     candles = await self.client.fetch_deep_candles(
