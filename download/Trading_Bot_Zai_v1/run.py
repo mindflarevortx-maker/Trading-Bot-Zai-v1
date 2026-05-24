@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trading Bot Zai v1 — Main Entry Point
+Trading Bot Zai v1.2 — Main Entry Point
 
 Run this script to start the trading bot:
     python run.py
@@ -74,7 +74,7 @@ def setup_logging():
     root_logger.addHandler(file_handler)
 
     # Reduce noise from third-party loggers
-    for noisy in ["urllib3", "websocket", "httpx", "httpcore", "engineio", "socketio"]:
+    for noisy in ["urllib3", "websocket", "httpx", "httpcore", "engineio", "socketio", "pyquotex._api.history"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     return root_logger
@@ -85,15 +85,16 @@ def setup_logging():
 BANNER = """
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║              🤖 TRADING BOT ZAI v1 🤖                        ║
+║            🤖 TRADING BOT ZAI v1.2 🤖                        ║
 ║                                                               ║
-║         Quotex Signal Generator — 1-Min Binary Options       ║
+║       Quotex Signal Timeline — 1-Min Binary Options           ║
 ║                                                               ║
 ║  • 100+ Asset Pairs (Forex, OTC, Crypto, Commodities)        ║
 ║  • 30-Day Historical Analysis with 1-Min Candles             ║
-║  • Multi-Layer Confluence Strategy + Backtesting              ║
-║  • Continuous Hourly Signal Generation                        ║
-║  • 🟢 UP  /  🔴 DOWN  Signal Display                         ║
+║  • Time-Ordered Signals with Exact Trade Times (UTC+5)       ║
+║  • 7-Layer Confluence Strategy + Backtesting                  ║
+║  • Persistent Cache (fetch once, gap-fill hourly)             ║
+║  • 🟢 UP  /  🔴 DOWN  + 1 Martingale Step                    ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 """
@@ -106,7 +107,7 @@ async def main():
     print(BANNER)
 
     logger = setup_logging()
-    logger.info("Trading Bot Zai v1 starting...")
+    logger.info("Trading Bot Zai v1.2 starting...")
 
     # Validate credentials
     if not QUOTEX_EMAIL or not QUOTEX_PASSWORD:
@@ -135,6 +136,8 @@ async def main():
     print(f"   Assets: 100+ pairs (Forex, OTC, Crypto, Commodities, Indices)")
     print(f"   Strategy: 7-Layer Confluence + Backtesting")
     print(f"   Signal threshold: 95%+ confidence")
+    print(f"   Signals: Time-ordered with exact trade times (UTC+5)")
+    print(f"   Martingale: 1 step (2x on loss)")
     print()
 
     started = await scheduler.start()
@@ -147,7 +150,7 @@ async def main():
         while scheduler.is_running:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\n\n⏹️  Stopping Trading Bot Zai v1...")
+        print("\n\n⏹️  Stopping Trading Bot Zai v1.2...")
         await scheduler.stop()
         print("✅ Bot stopped. Goodbye!")
 

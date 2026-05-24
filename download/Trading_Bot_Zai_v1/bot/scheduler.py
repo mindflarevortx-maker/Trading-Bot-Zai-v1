@@ -1,18 +1,19 @@
 """
-Continuous Scheduler for Trading Bot Zai v1.
+Continuous Scheduler for Trading Bot Zai v1.2.
 
 Implements the main loop:
   1. Connect to Quotex
-  2. Initial fetch: 30 days of 1-min historical data for all assets
-  3. Run backtesting on all assets
-  4. Generate signals for the next 1 hour
+  2. Fetch 30 days of 1-min historical data for all available assets (ONCE)
+  3. Save/caches all data locally (persistent — never re-fetches)
+  4. Generate TIME-ORDERED signals for next 1 hour
   5. Wait 1 hour
-  6. Fetch recent hour data, merge with cached data
-  7. Re-run backtesting on merged data
-  8. Generate new signals
+  6. Fetch ONLY the missing gap data for all assets (last hour)
+  7. Merge gap data with cached data
+  8. Re-run analysis on updated data + generate new signals
   9. Repeat from step 5
 
-The scheduler runs as an asyncio task and can be started/stopped.
+The key change: historical data is fetched ONCE and cached persistently.
+Subsequent cycles only fetch the 1-hour gap to fill missing candles.
 """
 
 import asyncio
@@ -22,16 +23,17 @@ from typing import Optional
 
 from bot.config import (
     FULL_REFRESH_INTERVAL_HOURS,
-    SIGNAL_GENERATION_INTERVAL,
     CACHE_DURATION_SECONDS,
     HISTORY_SECONDS,
     CANDLE_PERIOD,
+    USER_TZ,
 )
 from bot.quotex_client import QuotexClient
 from bot.asset_manager import AssetManager
 from bot.data_fetcher import DataFetcher
 from bot.cache_manager import CacheManager
 from bot.signal_generator import SignalGenerator
+from datetime import datetime
 
 logger = logging.getLogger("scheduler")
 
@@ -39,7 +41,7 @@ logger = logging.getLogger("scheduler")
 class TradingScheduler:
     """
     Main continuous trading scheduler.
-    Manages the full lifecycle: connect → fetch → analyze → signal → refresh → repeat.
+    Fetches data ONCE, then only gap-fills on hourly cycles.
     """
 
     def __init__(self):
@@ -80,15 +82,11 @@ class TradingScheduler:
         return self._cycle_count
 
     async def start(self) -> bool:
-        """
-        Start the trading scheduler.
-        Connects to Quotex, initializes assets, and begins the main loop.
-        """
+        """Start the trading scheduler."""
         if self._running:
-            logger.warning("Scheduler is already running")
             return True
 
-        logger.info("Starting Trading Bot Zai v1...")
+        logger.info("Starting Trading Bot Zai v1.2...")
 
         # Step 1: Connect to Quotex
         self._status = "connecting"
@@ -101,13 +99,11 @@ class TradingScheduler:
         # Step 2: Initialize asset manager
         self._status = "initializing_assets"
         await self.asset_manager.initialize(self.client)
-
         assets = self.asset_manager.available_assets
         if not assets:
-            logger.error("No assets available. Check your Quotex account.")
+            logger.error("No assets available.")
             self._status = "no_assets"
             return False
-
         logger.info(f"Trading {len(assets)} assets")
 
         # Step 3: Initialize data fetcher and signal generator
@@ -118,28 +114,24 @@ class TradingScheduler:
             data_fetcher=self.data_fetcher,
         )
 
-        # Step 4: Start the main loop as an async task
+        # Step 4: Start main loop
         self._running = True
         self._task = asyncio.create_task(self._main_loop())
-
-        logger.info("Trading Bot Zai v1 started successfully!")
+        logger.info("Trading Bot Zai v1.2 started successfully!")
         return True
 
     async def stop(self):
         """Stop the trading scheduler gracefully."""
-        logger.info("Stopping Trading Bot Zai v1...")
+        logger.info("Stopping Trading Bot Zai v1.2...")
         self._running = False
-
         if self._task and not self._task.done():
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
-
         await self.client.disconnect()
         self._status = "stopped"
-        logger.info("Trading Bot Zai v1 stopped.")
 
     async def _main_loop(self):
         """Main continuous loop."""
@@ -148,28 +140,33 @@ class TradingScheduler:
                 self._cycle_count += 1
                 cycle_start = time.time()
 
+                now_local = datetime.now(tz=USER_TZ)
                 logger.info(f"{'='*60}")
-                logger.info(f"CYCLE #{self._cycle_count} STARTING")
+                logger.info(f"CYCLE #{self._cycle_count} STARTING at {now_local.strftime('%H:%M:%S')}")
                 logger.info(f"{'='*60}")
 
-                # ─── Phase 1: Initial or Full Refresh ──────────────────
-                if self._cycle_count == 1 or self._need_full_refresh():
-                    await self._phase_full_refresh()
+                # Phase 1: Fetch or gap-fill data
+                if self._cycle_count == 1:
+                    await self._phase_initial_fetch()
                 else:
-                    await self._phase_hourly_refresh()
+                    await self._phase_gap_fill()
 
-                # ─── Phase 2: Generate Signals ─────────────────────────
+                # Phase 2: Generate time-ordered signals
                 await self._phase_generate_signals()
 
-                # ─── Phase 3: Wait for next cycle ──────────────────────
+                # Phase 3: Wait for next cycle
                 cycle_elapsed = time.time() - cycle_start
                 wait_time = max(0, FULL_REFRESH_INTERVAL_HOURS * 3600 - cycle_elapsed)
 
                 if wait_time > 0:
                     self._status = "waiting"
+                    next_cycle = datetime.fromtimestamp(
+                        time.time() + wait_time, tz=USER_TZ
+                    )
                     logger.info(
                         f"Cycle #{self._cycle_count} complete. "
-                        f"Next cycle in {wait_time/60:.1f} minutes"
+                        f"Next cycle at {next_cycle.strftime('%H:%M:%S')} "
+                        f"({wait_time/60:.1f} min)"
                     )
                     await self._interruptible_sleep(wait_time)
 
@@ -179,76 +176,77 @@ class TradingScheduler:
             logger.error(f"Main loop error: {e}", exc_info=True)
             self._status = "error"
 
-    async def _phase_full_refresh(self):
+    async def _phase_initial_fetch(self):
         """
-        Full data refresh: Fetch 30 days of historical data for all assets.
+        Initial fetch: Get 30 days of historical data for ALL assets.
+        Only fetch assets that don't already have cached data.
         """
-        self._status = "fetching_full_data"
+        self._status = "fetching_initial_data"
         assets = self.asset_manager.available_assets
 
-        logger.info(f"Phase 1: Full data refresh for {len(assets)} assets...")
+        # Check which assets already have cached data
+        assets_to_fetch = [a for a in assets if not self.cache_manager.has_data(a)]
+        cached_count = len(assets) - len(assets_to_fetch)
 
-        # Check which assets need fresh data
-        assets_to_fetch = []
-        for asset in assets:
-            if not self.cache_manager.is_cache_valid(asset):
-                assets_to_fetch.append(asset)
+        logger.info(
+            f"Phase 1: Initial data fetch — "
+            f"{len(assets_to_fetch)} assets need data, "
+            f"{cached_count} already cached"
+        )
 
         if assets_to_fetch:
-            logger.info(f"Fetching data for {len(assets_to_fetch)} assets (rest cached)")
-
-            # Fetch in batches
             results = await self.data_fetcher.fetch_all_assets(
                 assets=assets_to_fetch,
                 amount_of_seconds=HISTORY_SECONDS,
                 period=CANDLE_PERIOD,
-                progress_callback=self._fetch_progress_callback,
             )
-
-            # Save to cache
             for asset, candles in results.items():
                 if candles:
                     self.cache_manager.save(asset, candles)
-        else:
-            logger.info("All assets have valid cached data")
 
         self._last_full_refresh = time.time()
+        cached_total = sum(1 for a in assets if self.cache_manager.has_data(a))
+        logger.info(f"Data ready: {cached_total}/{len(assets)} assets cached")
 
-    async def _phase_hourly_refresh(self):
+    async def _phase_gap_fill(self):
         """
-        Hourly refresh: Fetch last hour of data and merge with cache.
+        Hourly gap-fill: Fetch ONLY the missing hour of data and merge.
+        Does NOT re-fetch the entire 30-day history.
         """
-        self._status = "refreshing_hourly"
+        self._status = "gap_filling"
         assets = self.asset_manager.available_assets
+        logger.info(f"Phase 1b: Gap-fill for {len(assets)} assets...")
 
-        logger.info(f"Phase 1b: Hourly data refresh for {len(assets)} assets...")
-
-        # Fetch recent data and merge
         await self.signal_generator.refresh_and_merge(assets)
 
-        # Also check for any assets that have expired cache
-        for asset in assets:
-            if not self.cache_manager.is_cache_valid(asset):
-                logger.info(f"[{asset}] Cache expired, fetching full history...")
-                candles = await self.data_fetcher.fetch_asset_history(asset)
+        # Check for any assets that still have no data at all
+        missing = [a for a in assets if not self.cache_manager.has_data(a)]
+        if missing:
+            logger.info(f"Found {len(missing)} assets with no data, fetching...")
+            results = await self.data_fetcher.fetch_all_assets(
+                assets=missing,
+                amount_of_seconds=HISTORY_SECONDS,
+                period=CANDLE_PERIOD,
+            )
+            for asset, candles in results.items():
                 if candles:
                     self.cache_manager.save(asset, candles)
 
     async def _phase_generate_signals(self):
-        """
-        Generate signals for all assets.
-        """
+        """Generate TIME-ORDERED signals for the next hour."""
         self._status = "generating_signals"
         assets = self.asset_manager.available_assets
 
-        logger.info(f"Phase 2: Generating signals for {len(assets)} assets...")
+        # Only analyze assets that have cached data
+        cached_assets = [a for a in assets if self.cache_manager.has_data(a)]
+        logger.info(f"Phase 2: Generating signals for {len(cached_assets)} cached assets...")
 
-        signals = await self.signal_generator.generate_signals(assets)
+        signals = await self.signal_generator.generate_signals(cached_assets)
 
         # Store current signals
         self._current_signals = [s.to_dict() for s in signals]
 
-        # Add to history (keep last 1000)
+        # Add to history
         timestamp = time.time()
         for s in signals:
             self._signal_history.append({
@@ -256,54 +254,54 @@ class TradingScheduler:
                 "cycle": self._cycle_count,
                 "generated_at": timestamp,
             })
-
-        # Trim history
         if len(self._signal_history) > 1000:
             self._signal_history = self._signal_history[-1000:]
 
-        # Print summary
+        # Print signal timeline
         up_count = sum(1 for s in signals if s.direction == "UP")
         down_count = sum(1 for s in signals if s.direction == "DOWN")
 
-        logger.info(f"{'='*60}")
-        logger.info(f"SIGNAL SUMMARY — Cycle #{self._cycle_count}")
-        logger.info(f"{'='*60}")
-        logger.info(f"  Total Signals: {len(signals)}")
-        logger.info(f"  🟢 UP:   {up_count}")
-        logger.info(f"  🔴 DOWN: {down_count}")
-        logger.info(f"{'='*60}")
-
-        for s in sorted(signals, key=lambda x: x.asset):
-            logger.info(f"  {s.emoji} {s.asset:20s} {s.direction:4s} ({s.confidence:.1f}%)")
+        now_local = datetime.now(tz=USER_TZ)
+        end_local = datetime.fromtimestamp(
+            time.time() + FULL_REFRESH_INTERVAL_HOURS * 3600, tz=USER_TZ
+        )
 
         logger.info(f"{'='*60}")
+        logger.info(f"SIGNAL TIMELINE — Cycle #{self._cycle_count}")
+        logger.info(f"  {now_local.strftime('%H:%M')} → {end_local.strftime('%H:%M')} ({USER_TZ})")
+        logger.info(f"  Total: {len(signals)} | 🟢 UP: {up_count} | 🔴 DOWN: {down_count}")
+        logger.info(f"{'='*60}")
 
-    def _need_full_refresh(self) -> bool:
-        """Check if a full data refresh is needed."""
-        if self._last_full_refresh == 0:
-            return True
-        elapsed = time.time() - self._last_full_refresh
-        return elapsed > FULL_REFRESH_INTERVAL_HOURS * 3600
+        for s in signals:
+            martingale_info = ""
+            if s.martingale and len(s.martingale) > 1:
+                m = s.martingale[1]
+                martingale_info = f" | Martingale: {m['amount']}x if loss"
+
+            logger.info(
+                f"  {s.trade_time_local}  {s.emoji} {s.asset:20s} "
+                f"{s.direction:4s} ({s.confidence:.1f}%){martingale_info}"
+            )
+
+        if not signals:
+            logger.info("  No high-confidence signals this cycle")
+
+        logger.info(f"{'='*60}")
 
     async def _interruptible_sleep(self, seconds: float):
         """Sleep that can be interrupted by stop()."""
-        check_interval = 5  # Check every 5 seconds
+        check_interval = 5
         elapsed = 0.0
-
         while elapsed < seconds and self._running:
             sleep_time = min(check_interval, seconds - elapsed)
             await asyncio.sleep(sleep_time)
             elapsed += sleep_time
 
-    def _fetch_progress_callback(self, asset: str, index: int, total: int, candles: int):
-        """Callback for data fetching progress."""
-        if index % 10 == 0 or index == total:
-            logger.info(f"  Fetch progress: {index}/{total} ({candles} candles for {asset})")
-
     def get_status_dict(self) -> dict:
         """Get full status information."""
         cache_stats = self.cache_manager.get_cache_stats()
         asset_stats = self.asset_manager.get_stats()
+        now_local = datetime.now(tz=USER_TZ)
 
         return {
             "running": self._running,
@@ -315,4 +313,6 @@ class TradingScheduler:
             "current_signals_count": len(self._current_signals),
             "signal_history_count": len(self._signal_history),
             "last_full_refresh": self._last_full_refresh,
+            "local_time": now_local.strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone": str(USER_TZ),
         }

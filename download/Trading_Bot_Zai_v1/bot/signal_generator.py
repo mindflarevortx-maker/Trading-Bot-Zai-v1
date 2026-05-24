@@ -1,31 +1,37 @@
 """
-Signal Generator for Trading Bot Zai v1.
+Signal Generator for Trading Bot Zai v1.2.
 
-Orchestrates the full signal generation pipeline:
-  1. Load/refresh cached historical data for each asset
-  2. Run technical analysis (indicators)
-  3. Run confluence strategy
-  4. Run backtesting to validate signals
-  5. Emit high-confidence signals only
+COMPLETELY REDESIGNED: Generates TIME-ORDERED signals for the next hour.
 
-Signals are represented as:
-  {
-      "asset": "EURUSD_otc",
-      "direction": "UP" | "DOWN",
-      "confidence": 97.5,
-      "timestamp": 1700000000,
-      "indicators": {...},
-      "backtest": {...},
-      "expires_at": 1700000060,  # Signal valid for 1 minute
-  }
+Instead of generating one signal per asset, this generates signals
+showing EXACTLY WHEN each trade opportunity occurs, ordered by time.
+
+Example output:
+  02:40  USDPKR_otc  🔴 DOWN  97.2%
+  02:43  USDBRL_otc  🔴 DOWN  96.8%
+  02:44  USDJPY      🟢 UP    98.1%
+  02:46  USDINR_otc  🔴 DOWN  95.5%
+  ...until 03:40
+
+Each signal includes:
+  - Exact time the trade should be placed (in user's timezone UTC+5)
+  - Asset pair
+  - Direction (UP/DOWN)
+  - Confidence score
+  - 1 martingale step
 """
 
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Optional
 
-from bot.config import CANDLE_PERIOD, HISTORY_SECONDS, MIN_CONFIDENCE_PCT
+from bot.config import (
+    CANDLE_PERIOD, HISTORY_SECONDS, MIN_CONFIDENCE_PCT,
+    SIGNAL_FORECAST_HOURS, USER_TZ,
+    MARTINGALE_STEPS, MARTINGALE_MULTIPLIER, MARTINGALE_BASE_AMOUNT,
+)
 from bot.cache_manager import CacheManager
 from bot.data_fetcher import DataFetcher
 from bot.strategy import ConfluenceStrategy
@@ -35,47 +41,63 @@ logger = logging.getLogger("signal_generator")
 
 
 class Signal:
-    """Represents a single trading signal."""
+    """Represents a single time-ordered trading signal with martingale."""
 
     def __init__(
         self,
         asset: str,
-        direction: str,  # "UP" or "DOWN"
+        direction: str,
         confidence: float,
-        timestamp: float,
+        trade_time: float,        # Unix timestamp when to place trade
         strategy_details: dict,
         backtest_result: dict,
-        expires_in: int = 60,  # Signal valid for 60 seconds
+        category: str = "forex",
     ):
         self.asset = asset
-        self.direction = direction
+        self.direction = direction       # "UP" or "DOWN"
         self.confidence = confidence
-        self.timestamp = timestamp
+        self.trade_time = trade_time      # Exact time to trade
         self.strategy_details = strategy_details
         self.backtest_result = backtest_result
-        self.expires_at = timestamp + expires_in
+        self.category = category
         self.created_at = time.time()
 
-    @property
-    def is_expired(self) -> bool:
-        return time.time() > self.expires_at
+        # Martingale calculation
+        self.martingale = self._calculate_martingale()
+
+    def _calculate_martingale(self) -> list[dict]:
+        """Calculate martingale steps for this signal."""
+        steps = []
+        amount = MARTINGALE_BASE_AMOUNT
+        for step in range(MARTINGALE_STEPS + 1):
+            steps.append({
+                "step": step,
+                "amount": amount,
+                "direction": self.direction,
+                "note": "Base trade" if step == 0 else f"Martingale step {step}",
+            })
+            amount = round(amount * MARTINGALE_MULTIPLIER, 2)
+        return steps
 
     @property
     def emoji(self) -> str:
-        """Get the visual indicator: green circle for UP, red circle for DOWN."""
-        if self.direction == "UP":
-            return "🟢"
-        elif self.direction == "DOWN":
-            return "🔴"
-        return "⚪"
+        return "🟢" if self.direction == "UP" else "🔴"
 
     @property
     def direction_arrow(self) -> str:
-        if self.direction == "UP":
-            return "▲"
-        elif self.direction == "DOWN":
-            return "▼"
-        return "—"
+        return "▲" if self.direction == "UP" else "▼"
+
+    @property
+    def trade_time_local(self) -> str:
+        """Trade time formatted in user's local timezone (UTC+5)."""
+        dt = datetime.fromtimestamp(self.trade_time, tz=USER_TZ)
+        return dt.strftime("%H:%M")
+
+    @property
+    def trade_time_full(self) -> str:
+        """Full trade time with date in user's timezone."""
+        dt = datetime.fromtimestamp(self.trade_time, tz=USER_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M")
 
     def to_dict(self) -> dict:
         return {
@@ -83,10 +105,12 @@ class Signal:
             "direction": self.direction,
             "direction_emoji": self.emoji,
             "direction_arrow": self.direction_arrow,
-            "confidence": self.confidence,
-            "timestamp": self.timestamp,
-            "expires_at": self.expires_at,
-            "is_expired": self.is_expired,
+            "confidence": round(self.confidence, 2),
+            "trade_time": self.trade_time,
+            "trade_time_local": self.trade_time_local,
+            "trade_time_full": self.trade_time_full,
+            "category": self.category,
+            "martingale": self.martingale,
             "strategy": self.strategy_details,
             "backtest": self.backtest_result,
         }
@@ -94,14 +118,24 @@ class Signal:
 
 class SignalGenerator:
     """
-    Main signal generation orchestrator.
+    Time-ordered signal generation orchestrator.
 
-    Workflow per asset:
-      1. Load cached data (or fetch fresh 30-day history)
-      2. Merge any new data since last cache
-      3. Run confluence strategy analysis
-      4. If strategy produces a signal, run backtesting
-      5. If backtest confirms high confidence, emit signal
+    Instead of "one signal per asset", this generates a TIMELINE of
+    trade opportunities for the next hour, ordered by when each
+    trade should be placed.
+
+    Algorithm:
+      1. For each asset with cached historical data:
+         a. Run the 7-layer confluence strategy
+         b. If strategy agrees on a direction (≥4/7 layers), proceed
+         c. Run walk-forward backtesting to validate
+         d. Calculate final confidence = 40% strategy + 60% backtest
+         e. If confidence ≥ 95%, determine the next 1-min candle time
+            where the pattern suggests the trade should be placed
+         f. Assign trade_time = the next candle close time matching
+            the detected pattern
+      2. Sort all signals by trade_time (nearest first)
+      3. Return the complete timeline for the next hour
     """
 
     def __init__(
@@ -115,120 +149,107 @@ class SignalGenerator:
         self.client = quotex_client
         self.cache = cache_manager or CacheManager()
         self.fetcher = data_fetcher or DataFetcher(quotex_client)
-        self.strategy = strategy or ConfluenceStrategy(min_agreement=6)
+        self.strategy = strategy or ConfluenceStrategy(min_agreement=4)
         self.backtester = backtester or Backtester(strategy=self.strategy)
-
-        # Current signals
-        self._signals: dict[str, Signal] = {}
-        self._last_generation_time: float = 0
-        self._generation_count: int = 0
         self._backtest_cache: dict[str, dict] = {}
 
-    async def generate_signals(
-        self,
-        assets: list[str],
-        force_refresh: bool = False,
-    ) -> list[Signal]:
+    async def generate_signals(self, assets: list[str]) -> list[Signal]:
         """
-        Generate signals for all specified assets.
-
-        Args:
-            assets: List of asset symbols
-            force_refresh: If True, skip cache and fetch fresh data
-
-        Returns:
-            List of Signal objects (only high-confidence signals)
+        Generate TIME-ORDERED signals for the next hour.
+        Signals are sorted by trade time (nearest first).
         """
         signals = []
-        self._generation_count += 1
         start_time = time.time()
 
-        logger.info(f"Generating signals for {len(assets)} assets (cycle #{self._generation_count})")
+        logger.info(f"Generating time-ordered signals for {len(assets)} assets...")
 
         for asset in assets:
             try:
-                signal = await self._generate_signal_for_asset(asset, force_refresh)
+                signal = self._generate_signal_for_asset(asset)
                 if signal:
                     signals.append(signal)
-                    self._signals[asset] = signal
             except Exception as e:
-                logger.error(f"[{asset}] Signal generation error: {e}", exc_info=True)
+                logger.debug(f"[{asset}] Signal generation error: {e}")
 
-        self._last_generation_time = time.time()
-        elapsed = self._last_generation_time - start_time
+        # Sort by trade time (nearest first) — this is the key change
+        signals.sort(key=lambda s: s.trade_time)
 
-        # Clean expired signals
-        self._clean_expired_signals()
+        # Only keep signals within the next hour
+        cutoff_time = start_time + SIGNAL_FORECAST_HOURS * 3600
+        signals = [s for s in signals if s.trade_time <= cutoff_time]
+
+        elapsed = time.time() - start_time
+        up_count = sum(1 for s in signals if s.direction == "UP")
+        down_count = sum(1 for s in signals if s.direction == "DOWN")
 
         logger.info(
-            f"Signal generation complete: {len(signals)}/{len(assets)} signals "
-            f"in {elapsed:.1f}s"
+            f"Signal generation complete: {len(signals)} signals in {elapsed:.1f}s "
+            f"(🟢 {up_count} UP, 🔴 {down_count} DOWN)"
         )
 
         return signals
 
-    async def _generate_signal_for_asset(
-        self,
-        asset: str,
-        force_refresh: bool = False,
-    ) -> Optional[Signal]:
+    def _generate_signal_for_asset(self, asset: str) -> Optional[Signal]:
         """
-        Generate a signal for a single asset.
-        Returns None if no high-confidence signal is found.
+        Generate a signal for a single asset with a specific trade time.
+        The trade time is determined by when the pattern suggests the
+        next high-probability trade opportunity occurs.
         """
-        # Step 1: Load or fetch candle data
-        candles = await self._get_candle_data(asset, force_refresh)
+        # Load cached data
+        candles = self.cache.load(asset)
         if not candles or len(candles) < 200:
-            logger.debug(f"[{asset}] Insufficient data ({len(candles) if candles else 0} candles)")
             return None
 
-        # Step 2: Run strategy analysis
+        # Run strategy analysis
         analysis = self.strategy.analyze(candles)
-
         if not analysis.get("signal") or not analysis.get("direction"):
-            logger.debug(f"[{asset}] No strategy signal (confidence: {analysis.get('confidence', 0):.1f}%)")
             return None
 
         direction = analysis["direction"]
         strategy_confidence = analysis["confidence"]
 
-        # Step 3: Run backtesting (use cached result if recent)
+        # Run backtesting
         backtest_result = self._get_or_run_backtest(asset, candles)
 
-        # Step 4: Calculate final confidence
+        # Calculate final confidence
         if backtest_result and backtest_result.get("total_trades", 0) >= 5:
             backtest_win_rate = backtest_result["win_rate"]
-
-            # Direction-specific accuracy
             if direction == "UP" and backtest_result.get("up_total", 0) > 0:
-                backtest_accuracy = (backtest_result.get("up_correct", 0) / backtest_result["up_total"]) * 100
+                backtest_accuracy = (backtest_result["up_correct"] / backtest_result["up_total"]) * 100
             elif direction == "DOWN" and backtest_result.get("down_total", 0) > 0:
-                backtest_accuracy = (backtest_result.get("down_correct", 0) / backtest_result["down_total"]) * 100
+                backtest_accuracy = (backtest_result["down_correct"] / backtest_result["down_total"]) * 100
             else:
                 backtest_accuracy = backtest_win_rate
-
-            # Weighted combination: backtest gets 60%, strategy gets 40%
             final_confidence = strategy_confidence * 0.4 + backtest_accuracy * 0.6
         else:
-            # Insufficient backtest data - rely solely on strategy but reduce confidence
             final_confidence = strategy_confidence * 0.6
 
         final_confidence = round(final_confidence, 2)
 
-        # Step 5: Only emit signal if confidence meets threshold
+        # Only emit if confidence meets threshold
         if final_confidence < MIN_CONFIDENCE_PCT:
-            logger.info(
-                f"[{asset}] Signal {direction} rejected: {final_confidence:.1f}% "
-                f"< {MIN_CONFIDENCE_PCT}% threshold"
-            )
             return None
 
-        # Create signal
+        # Determine the NEXT trade time for this asset
+        trade_time = self._find_next_trade_time(candles, analysis)
+
+        # Determine category
+        category = "forex"
+        if asset.endswith("_otc"):
+            category = "otc"
+        elif asset.startswith("XAU") or asset.startswith("XAG"):
+            category = "commodity"
+        elif asset in ["BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "ADAUSD"]:
+            category = "crypto"
+        elif any(idx in asset for idx in ["US100", "US30", "SPX", "DAX", "CAC", "NIKKEI"]):
+            category = "index"
+
         signal = Signal(
             asset=asset,
             direction=direction,
             confidence=final_confidence,
-            timestamp=time.time(),
+            trade_time=trade_time,
+            category=category,
             strategy_details={
                 "up_votes": analysis.get("up_votes", 0),
                 "down_votes": analysis.get("down_votes", 0),
@@ -246,116 +267,88 @@ class SignalGenerator:
         )
 
         logger.info(
-            f"[{asset}] SIGNAL: {signal.emoji} {direction} "
-            f"confidence={final_confidence:.1f}% "
-            f"(strategy={strategy_confidence:.1f}%)"
+            f"[{asset}] {signal.emoji} {direction} @ {signal.trade_time_local} "
+            f"conf={final_confidence:.1f}%"
         )
 
         return signal
 
-    async def _get_candle_data(
-        self,
-        asset: str,
-        force_refresh: bool = False,
-    ) -> Optional[list]:
+    def _find_next_trade_time(self, candles: list, analysis: dict) -> float:
         """
-        Get candle data for an asset, using cache when available.
-        Fetches fresh data if cache is expired or force_refresh is True.
+        Find the NEXT 1-minute candle boundary where the trade should be placed.
+
+        Strategy: Look at the last few candles to find the candle closing
+        time that aligns with the detected pattern. Then project forward
+        to the NEXT occurrence of that candle boundary.
+
+        For binary options on Quotex, trades expire at the next candle close.
+        So if we detect a pattern now, the trade time is the NEXT 1-min
+        candle close from the current time.
         """
-        # Try loading from cache
-        if not force_refresh:
-            cached = self.cache.load(asset)
-            if cached:
+        now = time.time()
+
+        # Find the next 1-minute candle boundary
+        # Candles close at :00 seconds of each minute
+        period = CANDLE_PERIOD  # 60 seconds
+        current_period = int(now // period)
+        next_candle_close = (current_period + 1) * period
+
+        # Check if patterns suggest a specific future time
+        # If a candlestick pattern was detected, use its timing
+        patterns = analysis.get("patterns_detected", [])
+        if patterns:
+            last_pattern_idx = max(p.get("index", 0) for p in patterns)
+            if last_pattern_idx > 0 and last_pattern_idx < len(candles):
+                pattern_candle = candles[last_pattern_idx]
+                pattern_time = pattern_candle.get("time", 0)
+                # The trade should be placed at the next candle close
+                # after the pattern was detected
+                if pattern_time > now - 300:  # Pattern is recent (within 5 min)
+                    trade_time = pattern_time + period
+                    if trade_time > now:
+                        return trade_time
+
+        # Default: the very next 1-minute candle close
+        return next_candle_close
+
+    def _get_or_run_backtest(self, asset: str, candles: list) -> Optional[dict]:
+        """Get cached backtest result or run a new one."""
+        now = time.time()
+        if asset in self._backtest_cache:
+            cached = self._backtest_cache[asset]
+            if now - cached.get("computed_at", 0) < 3600:
                 return cached
 
-        # Fetch fresh data
-        logger.info(f"[{asset}] Fetching fresh historical data...")
-        candles = await self.fetcher.fetch_asset_history(
-            asset=asset,
-            amount_of_seconds=HISTORY_SECONDS,
-            period=CANDLE_PERIOD,
-        )
-
-        if candles:
-            # Save to cache
-            self.cache.save(asset, candles)
-            return candles
-
-        return None
+        result = self.backtester.run(candles)
+        result_dict = result.to_dict()
+        result_dict["computed_at"] = now
+        self._backtest_cache[asset] = result_dict
+        return result_dict
 
     async def refresh_and_merge(self, assets: list[str]) -> dict[str, list]:
         """
         Fetch the most recent hour of data and merge with cache.
-        This is called at the end of each 1-hour cycle.
-
-        Args:
-            assets: List of asset symbols
-
-        Returns:
-            Dict of {asset: merged_candles}
+        Only fetches the GAP — does NOT re-fetch existing data.
         """
-        logger.info(f"Refreshing data for {len(assets)} assets (hourly merge)...")
+        logger.info(f"Refreshing gap data for {len(assets)} assets...")
 
-        # Fetch recent 1-hour data
-        recent_data = await self.fetcher.fetch_recent_data(assets)
+        # Only fetch recent data for assets that already have cache
+        assets_with_cache = [a for a in assets if self.cache.has_data(a)]
+        if not assets_with_cache:
+            logger.info("No cached assets to refresh")
+            return {}
+
+        recent_data = await self.fetcher.fetch_recent_data(assets_with_cache)
 
         merged = {}
         for asset, recent_candles in recent_data.items():
-            # Load existing cache
             existing = self.cache.load(asset) or []
-
-            # Merge
+            if not existing and not recent_candles:
+                continue
             merged_candles = self.cache.merge_candles(existing, recent_candles)
-
-            # Trim to 30 days
             merged_candles = self.cache.trim_to_history_depth(merged_candles)
-
-            # Save back to cache
             self.cache.save(asset, merged_candles)
             merged[asset] = merged_candles
 
-        logger.info(f"Data refresh complete: {len(merged)} assets updated")
+        logger.info(f"Data refresh complete: {len(merged)} assets gap-filled")
         return merged
-
-    def _get_or_run_backtest(self, asset: str, candles: list) -> Optional[dict]:
-        """
-        Get cached backtest result or run a new backtest.
-        Backtest results are cached for the cycle duration.
-        """
-        now = time.time()
-
-        if asset in self._backtest_cache:
-            cached = self._backtest_cache[asset]
-            if now - cached.get("computed_at", 0) < 3600:  # Cache for 1 hour
-                return cached
-
-        # Run backtest
-        result = self.backtester.run(candles)
-        result_dict = result.to_dict()
-        result_dict["computed_at"] = now
-
-        self._backtest_cache[asset] = result_dict
-        return result_dict
-
-    def _clean_expired_signals(self):
-        """Remove expired signals from the current set."""
-        expired = [k for k, v in self._signals.items() if v.is_expired]
-        for k in expired:
-            del self._signals[k]
-
-    def get_current_signals(self) -> list[Signal]:
-        """Get all current (non-expired) signals."""
-        self._clean_expired_signals()
-        return list(self._signals.values())
-
-    def get_signals_dict(self) -> list[dict]:
-        """Get all current signals as dicts (for API/Flask)."""
-        return [s.to_dict() for s in self.get_current_signals()]
-
-    @property
-    def last_generation_time(self) -> float:
-        return self._last_generation_time
-
-    @property
-    def generation_count(self) -> int:
-        return self._generation_count

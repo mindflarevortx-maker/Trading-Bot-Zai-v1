@@ -1,29 +1,30 @@
 """
-Historical Data Fetcher for Trading Bot Zai v1.
+Historical Data Fetcher for Trading Bot Zai v1.2.
 
 Handles fetching 30 days of 1-minute candle data for all asset pairs,
 with rate limiting, retry logic, and progress tracking.
+
+Key fix: progress_callback now takes 4 args (fetched_sec, total_sec, count, label)
+matching pyquotex's get_historical_candles signature.
 """
 
 import asyncio
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
-from bot.config import DATA_CACHE_DIR, CANDLE_PERIOD, HISTORY_SECONDS
+from bot.config import (
+    DATA_CACHE_DIR, CANDLE_PERIOD, HISTORY_SECONDS,
+    FETCH_MAX_CONCURRENT, FETCH_RETRIES, FETCH_BATCH_TIMEOUT,
+)
 
 logger = logging.getLogger("data_fetcher")
 
 
 class DataFetcher:
-    """
-    Fetches historical candle data for all assets.
-    Handles rate limiting, retries, and parallel fetching.
-    """
+    """Fetches historical candle data for all assets with rate limiting and retries."""
 
-    def __init__(self, quotex_client, max_concurrent: int = 3):
+    def __init__(self, quotex_client, max_concurrent: int = FETCH_MAX_CONCURRENT):
         self.client = quotex_client
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
@@ -34,19 +35,11 @@ class DataFetcher:
         asset: str,
         amount_of_seconds: int = HISTORY_SECONDS,
         period: int = CANDLE_PERIOD,
-        retries: int = 3,
+        retries: int = FETCH_RETRIES,
     ) -> list:
         """
         Fetch full historical data for a single asset with retry logic.
-
-        Args:
-            asset: Asset symbol (e.g. "EURUSD_otc")
-            amount_of_seconds: How far back to fetch (default 30 days)
-            period: Candle period in seconds (default 60 = 1 min)
-            retries: Number of retry attempts
-
-        Returns:
-            List of candle dicts sorted by time
+        Returns list of candle dicts sorted by time.
         """
         async with self._semaphore:
             self._progress[asset] = {"status": "fetching", "attempt": 0, "candles": 0}
@@ -55,10 +48,12 @@ class DataFetcher:
                 try:
                     self._progress[asset]["attempt"] = attempt
 
-                    def progress_cb(fetched_sec, total_sec, count):
+                    # IMPORTANT: pyquotex progress_callback takes 4 args:
+                    # (fetched_seconds, total_seconds, candle_count, worker_label)
+                    def progress_cb(fetched_sec, total_sec, count, label=""):
                         self._progress[asset]["candles"] = count
 
-                    candles = await self.client.fetch_deep_candles(
+                    candles = await self.client.fetch_historical_candles(
                         asset=asset,
                         amount_of_seconds=amount_of_seconds,
                         period=period,
@@ -66,7 +61,6 @@ class DataFetcher:
                     )
 
                     if candles and len(candles) > 0:
-                        # Sort by time
                         candles.sort(key=lambda c: c.get("time", 0))
                         self._progress[asset]["status"] = "done"
                         self._progress[asset]["candles"] = len(candles)
@@ -78,7 +72,6 @@ class DataFetcher:
                 except Exception as e:
                     logger.warning(f"[{asset}] Fetch error attempt {attempt}: {e}")
 
-                # Exponential backoff between retries
                 if attempt < retries:
                     wait = 2 ** attempt
                     logger.info(f"[{asset}] Retrying in {wait}s...")
@@ -95,32 +88,15 @@ class DataFetcher:
         period: int = CANDLE_PERIOD,
         progress_callback: Optional[Callable] = None,
     ) -> dict[str, list]:
-        """
-        Fetch historical data for all assets in parallel (with rate limiting).
-
-        Args:
-            assets: List of asset symbols
-            amount_of_seconds: History depth
-            period: Candle period
-            progress_callback: Optional callback(asset, index, total, candles_count)
-
-        Returns:
-            Dict mapping asset symbol to candle list
-        """
+        """Fetch historical data for all assets in parallel batches."""
         results = {}
         total = len(assets)
-
         logger.info(f"Starting historical data fetch for {total} assets...")
 
-        # Process in batches to avoid overwhelming the API
         batch_size = self.max_concurrent
         for i in range(0, total, batch_size):
             batch = assets[i:i + batch_size]
-
-            tasks = []
-            for asset in batch:
-                tasks.append(self.fetch_asset_history(asset, amount_of_seconds, period))
-
+            tasks = [self.fetch_asset_history(a, amount_of_seconds, period) for a in batch]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for asset, result in zip(batch, batch_results):
@@ -129,20 +105,15 @@ class DataFetcher:
                     results[asset] = []
                 else:
                     results[asset] = result
-
                 if progress_callback:
                     idx = assets.index(asset) + 1
                     progress_callback(asset, idx, total, len(results[asset]))
 
-            # Small delay between batches to be respectful
             if i + batch_size < total:
                 await asyncio.sleep(1)
 
         successful = sum(1 for v in results.values() if v)
-        logger.info(
-            f"Historical fetch complete: {successful}/{total} assets with data"
-        )
-
+        logger.info(f"Historical fetch complete: {successful}/{total} assets with data")
         return results
 
     async def fetch_recent_data(
@@ -151,27 +122,13 @@ class DataFetcher:
         offset: int = 3600,
         period: int = CANDLE_PERIOD,
     ) -> dict[str, list]:
-        """
-        Fetch the most recent hour of candle data for cache merging.
-
-        Args:
-            assets: List of asset symbols
-            offset: Seconds of recent data (default 3600 = 1 hour)
-            period: Candle period
-
-        Returns:
-            Dict mapping asset symbol to recent candle list
-        """
+        """Fetch the most recent hour of candle data for cache gap-fill."""
         results = {}
         batch_size = self.max_concurrent
 
         for i in range(0, len(assets), batch_size):
             batch = assets[i:i + batch_size]
-
-            tasks = []
-            for asset in batch:
-                tasks.append(self.client.fetch_recent_candles(asset, offset, period))
-
+            tasks = [self.client.fetch_recent_candles(a, offset, period) for a in batch]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for asset, result in zip(batch, batch_results):
@@ -187,5 +144,4 @@ class DataFetcher:
         return results
 
     def get_progress(self) -> dict:
-        """Get current fetch progress for all assets."""
         return dict(self._progress)
