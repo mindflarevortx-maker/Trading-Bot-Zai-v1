@@ -1,0 +1,18 @@
+# Trading Bot Zai v1 — Requirements
+# Install: pip install -r requirements.txt
+
+# Core
+numpy>=1.24.0
+flask>=3.0.0
+
+# Quotex API (one of these must be installed)
+pyquotex>=0.1.0
+
+# Optional: for better HTTP handling
+httpx>=0.25.0
+
+# Optional: for .env file support
+python-dotenv>=1.0.0
+
+# Optional: for SSL/TLS handling
+certifi>=2023.7.22
