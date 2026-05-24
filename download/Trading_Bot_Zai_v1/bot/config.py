@@ -15,7 +15,7 @@ LOG_DIR = BASE_DIR / "logs"
 # ─── Quotex Credentials ──────────────────────────────────────────────
 QUOTEX_EMAIL = os.getenv("QUOTEX_EMAIL", "")
 QUOTEX_PASSWORD = os.getenv("QUOTEX_PASSWORD", "")
-QUOTEX_HOST = os.getenv("QUOTEX_HOST", "qxbroker.com")
+QUOTEX_HOST = os.getenv("QUOTEX_HOST", "market-qx.trade")
 QUOTEX_LANG = os.getenv("QUOTEX_LANG", "en")
 
 # ─── Account Mode ────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ A professional-grade trading signal bot that analyzes 30 days of 1-minute histor
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the Bot](#running-the-bot)
+- [CloudFlare / Session Extraction](#cloudflare--session-extraction)
 - [Understanding the Signals](#understanding-the-signals)
 - [Strategy Details](#strategy-details)
 - [Project Structure](#project-structure)
@@ -34,7 +35,9 @@ A professional-grade trading signal bot that analyzes 30 days of 1-minute histor
 - **Continuous Operation** — Runs 24/7 with automatic hourly refresh cycles
 - **Real-Time Web Dashboard** — Flask-powered dashboard with 🟢 UP / 🔴 DOWN signal display
 - **Candlestick Pattern Recognition** — Detects engulfing, hammer, shooting star, morning/evening star, doji patterns
+- **3-Tier Connection Fallback** — Direct login → Saved session → Browser-based login
 - **Auto-Reconnection** — Handles connection drops gracefully
+- **Custom Domain Support** — Works with any Quotex mirror domain (market-qx.trade, qxbroker.com, etc.)
 
 ---
 
@@ -43,7 +46,7 @@ A professional-grade trading signal bot that analyzes 30 days of 1-minute histor
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    STARTUP                                    │
-│  1. Connect to Quotex (email + password auth)               │
+│  1. Connect to Quotex (3-tier fallback auth)                │
 │  2. Discover 100+ available asset pairs                      │
 │  3. Fetch 30 days of 1-min candle data for each asset       │
 │  4. Cache all data locally                                   │
@@ -83,14 +86,20 @@ A professional-grade trading signal bot that analyzes 30 days of 1-minute histor
 - **Quotex account** (email + password) — Use a DEMO/PRACTICE account for testing
 - **Internet connection** — Stable connection for WebSocket + HTTP API calls
 - **pip** — Python package manager
+- **Playwright** (optional) — For browser-based session extraction when CloudFlare blocks direct login
 
 ---
 
 ## 🛠️ Installation
 
-### Step 1: Extract the ZIP
+### Step 1: Clone or Extract
 
 ```bash
+# From GitHub
+git clone https://github.com/mindflarevortx-maker/Trading-Bot-Zai-v1.git
+cd Trading-Bot-Zai-v1
+
+# OR from ZIP
 unzip Trading_Bot_Zai_v1.zip
 cd Trading_Bot_Zai_v1
 ```
@@ -122,7 +131,16 @@ If `pyquotex` is not available on PyPI, install from the source repo:
 pip install git+https://github.com/cleitonleonel/pyquotex.git
 ```
 
-### Step 5: Configure your credentials
+### Step 5: Install Playwright (for browser-based login)
+
+This is needed when the Quotex domain uses CloudFlare protection:
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+### Step 6: Configure your credentials
 
 ```bash
 cp .env.example .env
@@ -134,6 +152,7 @@ Edit `.env` and add your Quotex credentials:
 QUOTEX_EMAIL=your_email@example.com
 QUOTEX_PASSWORD=your_password
 ACCOUNT_MODE=PRACTICE
+QUOTEX_HOST=market-qx.trade
 ```
 
 > ⚠️ **IMPORTANT**: Always start with `ACCOUNT_MODE=PRACTICE` (demo account) to test the bot without risking real money.
@@ -151,7 +170,7 @@ All configuration is in `.env` or `bot/config.py`.
 | `QUOTEX_EMAIL` | *required* | Your Quotex account email |
 | `QUOTEX_PASSWORD` | *required* | Your Quotex account password |
 | `ACCOUNT_MODE` | `PRACTICE` | `PRACTICE` (demo) or `REAL` (live) |
-| `QUOTEX_HOST` | `qxbroker.com` | Quotex server host |
+| `QUOTEX_HOST` | `market-qx.trade` | Quotex server host |
 | `QUOTEX_LANG` | `en` | Language for the web interface |
 | `FLASK_HOST` | `0.0.0.0` | Flask dashboard host |
 | `FLASK_PORT` | `5000` | Flask dashboard port |
@@ -173,7 +192,7 @@ All configuration is in `.env` or `bot/config.py`.
 
 ## 🚀 Running the Bot
 
-### Start the bot
+### Quick Start
 
 ```bash
 python run.py
@@ -187,8 +206,10 @@ You will see:
 ║         Quotex Signal Generator — 1-Min Binary Options       ║
 ╚═══════════════════════════════════════════════════════════════╝
 
+✅ Loaded .env from /path/to/.env
 🌐 Dashboard: http://0.0.0.0:5000
 🚀 Starting trading bot...
+   Host: market-qx.trade
 ```
 
 ### Open the dashboard
@@ -198,6 +219,44 @@ Navigate to **http://localhost:5000** in your browser to see live signals.
 ### Stop the bot
 
 Press `Ctrl+C` in the terminal to gracefully stop the bot.
+
+---
+
+## 🔐 CloudFlare / Session Extraction
+
+Some Quotex domains (like `market-qx.trade`) use **CloudFlare protection** that blocks automated HTTP login. The bot handles this with a **3-tier connection fallback**:
+
+### Tier 1: Direct HTTP Login
+The bot first tries to log in directly via pyquotex's HTTP authentication. This works when CloudFlare is not present or your network allows direct access.
+
+### Tier 2: Saved Session
+If direct login fails, the bot checks for a previously saved session in `session.json`. Sessions are automatically saved after successful login and can be reused for hours.
+
+### Tier 3: Browser-Based Login
+If no saved session exists, the bot attempts to open a real browser window using Playwright, where you can manually solve the CloudFlare challenge and log in.
+
+### Manual Session Extraction (Recommended)
+
+If you're running the bot for the first time on a CloudFlare-protected domain, use the session extractor:
+
+```bash
+python extract_session.py
+```
+
+This will:
+1. Open a real Chromium browser window
+2. Navigate to the Quotex login page
+3. Wait for you to solve the CloudFlare challenge and log in
+4. Automatically extract the session token and cookies
+5. Save them to `session.json` for the bot to use
+
+After extracting the session, run the bot normally:
+
+```bash
+python run.py
+```
+
+The bot will use the saved session to connect via WebSocket, bypassing CloudFlare entirely.
 
 ---
 
@@ -293,15 +352,18 @@ The backtester uses walk-forward validation:
 
 ```
 Trading_Bot_Zai_v1/
-├── run.py                    # Main entry point
+├── run.py                    # Main entry point (loads .env, starts bot)
+├── extract_session.py        # Browser-based session extractor
+├── test_connection.py        # Connection test and diagnostics
 ├── requirements.txt          # Python dependencies
 ├── .env.example              # Environment variable template
+├── .env                      # Your credentials (DO NOT commit!)
 ├── README.md                 # This guide
 │
 ├── bot/                      # Core bot package
 │   ├── __init__.py           # Package init
 │   ├── config.py             # Configuration & constants
-│   ├── quotex_client.py      # Quotex API client wrapper
+│   ├── quotex_client.py      # Quotex API client (3-tier fallback)
 │   ├── asset_manager.py      # Asset pair management (100+ pairs)
 │   ├── data_fetcher.py       # Historical data fetching with rate limiting
 │   ├── cache_manager.py      # 1-hour cache with merge logic
@@ -365,8 +427,7 @@ GET /api/signals
       "total_trades": 45,
       "wins": 43,
       "losses": 2,
-      "win_rate": 95.56,
-      ...
+      "win_rate": 95.56
     }
   }
 ]
@@ -376,12 +437,34 @@ GET /api/signals
 
 ## 🔧 Troubleshooting
 
-### "Connection failed" error
+### "Connection failed" / "CloudFlare challenge detected"
 
+This is the most common issue. Quotex domains use CloudFlare protection that blocks automated login.
+
+**Solution 1: Extract session manually**
+```bash
+python extract_session.py
+```
+Then run the bot: `python run.py`
+
+**Solution 2: Check your credentials**
 - Verify your Quotex email and password in `.env`
-- Check your internet connection
-- Try using a proxy if Quotex is blocked in your region
-- Delete `session.json` and retry (stale session)
+- Make sure `QUOTEX_HOST` is correct (e.g., `market-qx.trade`)
+
+**Solution 3: Delete stale session**
+```bash
+rm session.json
+python run.py
+```
+
+### "'Login' object has no attribute '_scraper'"
+
+This error occurs with older versions of pyquotex when the Login class is incorrectly patched. This has been fixed in v1.1 — the bot now patches class attributes instead of overriding `__init__`.
+
+**Solution:** Update to the latest version of the bot and ensure pyquotex is up to date:
+```bash
+pip install --upgrade pyquotex
+```
 
 ### "No assets available"
 
@@ -411,8 +494,8 @@ GET /api/signals
 ### Session expiration
 
 - Quotex sessions expire periodically
-- The bot automatically re-authenticates when the session expires
-- If re-auth fails, check your credentials and restart the bot
+- Run `python extract_session.py` again to get a fresh session
+- The bot automatically detects stale sessions and prompts for re-auth
 
 ---
 

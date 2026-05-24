@@ -26,8 +26,23 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# ─── Load .env file BEFORE importing config ────────────────────────
+# config.py reads env vars at import time, so we must load .env first.
+try:
+    from dotenv import load_dotenv
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"✅ Loaded .env from {env_path}")
+    else:
+        print(f"⚠️  No .env file found at {env_path}")
+        print(f"   Copy .env.example to .env and fill in your credentials.")
+except ImportError:
+    print("⚠️  python-dotenv not installed. Install with: pip install python-dotenv")
+    print("   Environment variables must be set manually.")
+
 from bot.config import (
-    QUOTEX_EMAIL, QUOTEX_PASSWORD, FLASK_HOST, FLASK_PORT,
+    QUOTEX_EMAIL, QUOTEX_PASSWORD, QUOTEX_HOST, FLASK_HOST, FLASK_PORT,
     LOG_LEVEL, LOG_FORMAT, LOG_DIR,
 )
 from bot.scheduler import TradingScheduler
@@ -114,6 +129,7 @@ async def main():
 
     # Start the trading scheduler
     print(f"\n🚀 Starting trading bot...")
+    print(f"   Host: {QUOTEX_HOST}")
     print(f"   Email: {QUOTEX_EMAIL[:3]}***@{QUOTEX_EMAIL.split('@')[1] if '@' in QUOTEX_EMAIL else '***'}")
     print(f"   Mode: PRACTICE")
     print(f"   Assets: 100+ pairs (Forex, OTC, Crypto, Commodities, Indices)")
